@@ -236,8 +236,29 @@ struct Pacing {
     not_before: Option<DateTime<Utc>>,
     /// Fetches in a row that GitHub rate-limited, for the backoff.
     strikes: u32,
+    /// Low remaining quota is a protected pause even without a rate-limit error.
+    low_budget_pause: bool,
+    /// Debounce toolbar refreshes without suppressing individual row requests.
+    last_manual: Option<DateTime<Utc>>,
     /// The last manual refresh, while repos older than it remain.
     forced_since: Option<DateTime<Utc>>,
+}
+
+impl Pacing {
+    fn manual_wake(&mut self, all: bool, now: DateTime<Utc>) {
+        let fresh = self
+            .last_manual
+            .is_none_or(|t| (now - t).num_seconds() >= MANUAL_DEBOUNCE);
+        if all && fresh {
+            self.last_manual = Some(now);
+            self.forced_since = Some(now);
+        }
+        // Manual requests may skip the normal gap or token-recovery pause,
+        // never a server backoff or the low-budget pause.
+        if (fresh || !all) && self.strikes == 0 && !self.low_budget_pause {
+            self.not_before = None;
+        }
+    }
 }
 
 /// Fetch `repo` into the snapshot. Errors about this repo land on its row;
@@ -392,6 +413,7 @@ fn step(app: &AppHandle, pacing: &mut Pacing) {
         let result = fetch_into_snapshot(app, &cfg, repo);
         let now = Utc::now();
         let mut snap = state.snapshot.lock().unwrap();
+        pacing.low_budget_pause = false;
         let (pause, error) = match result {
             Err(GhError::RateLimited(until)) => {
                 pacing.strikes += 1;
@@ -421,6 +443,7 @@ fn step(app: &AppHandle, pacing: &mut Pacing) {
             _ => {
                 pacing.strikes = 0;
                 if snap.rate_limit_remaining.is_some_and(|r| r < BUDGET_FLOOR) {
+                    pacing.low_budget_pause = true;
                     let resume = now + chrono::Duration::seconds(LOW_BUDGET_PAUSE);
                     let msg = format!("GitHub API budget low; pausing until {}", clock(resume));
                     (resume - now, Some(msg))
@@ -471,7 +494,6 @@ fn spawn_poller(app: AppHandle, rx: mpsc::Receiver<Wake>) {
         .name("craft-poller".into())
         .spawn(move || {
             let mut pacing = Pacing::default();
-            let mut last_manual: Option<DateTime<Utc>> = None;
             loop {
                 reload_config_if_changed(&app);
                 step(&app, &mut pacing);
@@ -488,18 +510,7 @@ fn spawn_poller(app: AppHandle, rx: mpsc::Receiver<Wake>) {
                         let all = std::iter::once(first)
                             .chain(rx.try_iter())
                             .any(|w| w == Wake::All);
-                        let now = Utc::now();
-                        let fresh =
-                            last_manual.is_none_or(|t| (now - t).num_seconds() >= MANUAL_DEBOUNCE);
-                        if all && fresh {
-                            last_manual = Some(now);
-                            pacing.forced_since = Some(now);
-                        }
-                        // A manual refresh, of everything or of one row, skips
-                        // the gap or a token pause, but never a rate-limit backoff.
-                        if (fresh || !all) && pacing.strikes == 0 {
-                            pacing.not_before = None;
-                        }
+                        pacing.manual_wake(all, Utc::now());
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(TICK),
@@ -840,6 +851,75 @@ pub fn run() {
 mod tests {
     use super::*;
     use chrono::Duration as CDuration;
+
+    #[test]
+    fn manual_refresh_preserves_low_budget_pause_for_toolbar_and_row() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let deadline = now + CDuration::seconds(LOW_BUDGET_PAUSE);
+        for all in [true, false] {
+            let mut pacing = Pacing {
+                not_before: Some(deadline),
+                low_budget_pause: true,
+                ..Default::default()
+            };
+            pacing.manual_wake(all, now);
+            assert_eq!(pacing.not_before, Some(deadline));
+            assert_eq!(pacing.forced_since, all.then_some(now));
+            pacing.manual_wake(all, now + CDuration::seconds(60));
+            assert_eq!(pacing.not_before, Some(deadline));
+        }
+    }
+
+    #[test]
+    fn manual_refresh_preserves_server_backoff_for_toolbar_and_row() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let deadline = now + CDuration::seconds(BACKOFF_MIN);
+        for all in [true, false] {
+            let mut pacing = Pacing {
+                not_before: Some(deadline),
+                strikes: 1,
+                ..Default::default()
+            };
+            pacing.manual_wake(all, now);
+            assert_eq!(pacing.not_before, Some(deadline));
+            assert_eq!(pacing.strikes, 1);
+        }
+    }
+
+    #[test]
+    fn manual_refresh_can_skip_normal_gap_or_token_recovery_pause() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for pause_secs in [REPO_GAP, 30 * 60] {
+            for all in [true, false] {
+                let mut pacing = Pacing {
+                    not_before: Some(now + CDuration::seconds(pause_secs)),
+                    ..Default::default()
+                };
+                pacing.manual_wake(all, now);
+                assert_eq!(pacing.not_before, None);
+                assert_eq!(pacing.forced_since, all.then_some(now));
+            }
+        }
+    }
+
+    #[test]
+    fn toolbar_is_debounced_but_row_requests_can_skip_normal_gap() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let deadline = now + CDuration::seconds(REPO_GAP);
+        let mut pacing = Pacing::default();
+        pacing.manual_wake(true, now);
+        pacing.not_before = Some(deadline);
+        pacing.manual_wake(true, now + CDuration::seconds(1));
+        assert_eq!(pacing.not_before, Some(deadline));
+        assert_eq!(pacing.forced_since, Some(now));
+        pacing.manual_wake(false, now + CDuration::seconds(1));
+        assert_eq!(pacing.not_before, None);
+        pacing.not_before = Some(deadline);
+        let due = now + CDuration::seconds(MANUAL_DEBOUNCE);
+        pacing.manual_wake(true, due);
+        assert_eq!(pacing.not_before, None);
+        assert_eq!(pacing.forced_since, Some(due));
+    }
 
     fn snap_with(ages_mins: &[i64], now: DateTime<Utc>) -> Snapshot {
         let mut s = Snapshot {
