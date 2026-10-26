@@ -55,18 +55,15 @@
     <footer data-tauri-drag-region>
       <span id="next" data-tauri-drag-region></span>
       <span id="budget" data-tauri-drag-region></span>
+      <span id="token" data-tauri-drag-region></span>
       <span class="spacer" data-tauri-drag-region></span>
       <button class="footer-link" id="edit-config">Edit config</button>
       <span id="shortcut"></span>
     </footer>
     <div id="resize" title="Resize"></div>
   </div>
-  <script>
-    // Surface load/runtime errors in the app's stderr (module errors never reach app.js).
-    const report = (m) => window.__TAURI__?.core.invoke('log', { msg: String(m) });
-    addEventListener('error', (e) => report(`${e.message} @ ${e.filename}:${e.lineno}`));
-    addEventListener('unhandledrejection', (e) => report(`unhandled: ${e.reason}`));
-  </script>
-  <script type="module" src="app.js"></script>
+  <!-- Compiled from ui/src/ by `npm run build` (run by the app's build.rs). -->
+  <script type="module" src="build/report.js"></script>
+  <script type="module" src="build/main.js"></script>
 </body>
 </html>

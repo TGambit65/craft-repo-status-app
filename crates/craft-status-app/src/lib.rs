@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use chrono::{DateTime, Local, Utc};
-use craft_core::{Cache, Config, Snapshot, WindowState};
+use chrono::{DateTime, Local, Timelike, Utc};
+use craft_core::{Cache, Config, Schedule, Snapshot, TokenStatus, WindowState};
 use craft_github::{resolve_token, Error as GhError, GitHub, RawActivity};
 use serde::Serialize;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
@@ -25,26 +25,31 @@ const TRAY: &str = "main";
 const EV_SNAPSHOT: &str = "craft:snapshot";
 const EV_FOCUS: &str = "craft:focus";
 const EV_META: &str = "craft:meta";
-/// Repositories fetched concurrently. One: GitHub's secondary rate limits
-/// cap GraphQL server time per minute, so parallel requests only trip them
-/// sooner (see `GRAPHQL_PACING` in craft-github); a poll has minutes to finish.
-const WORKERS: usize = 1;
 /// How often the poll thread wakes to check the clock, the config file and
 /// the tray tooltip. Wall-clock based, so a sleeping laptop polls on wake.
 const TICK: Duration = Duration::from_secs(15);
-/// Retry sooner than the poll interval when everything failed (offline, asleep…).
-const RETRY_AFTER_FAILURE: i64 = 60;
-/// Ignore manual refreshes this soon after the previous poll finished.
-const MANUAL_DEBOUNCE: i64 = 15;
-/// Below this many GraphQL points left, wait for the hourly reset.
+/// Repositories are fetched one at a time, this long apart, on top of the
+/// per-request pacing in craft-github: GitHub's secondary rate limits punish
+/// bursts, so a pass over every repo is spread over minutes.
+const REPO_GAP: i64 = 20;
+/// Wait this long before retrying a repo whose last fetch failed.
+const REPO_RETRY: i64 = 10 * 60;
+/// The first pause after GitHub rate-limits the app, doubling (up to
+/// `BACKOFF_MAX`) while it keeps doing so; never shorter than GitHub asks.
+const BACKOFF_MIN: i64 = 5 * 60;
+const BACKOFF_MAX: i64 = 60 * 60;
+/// Below this many GraphQL points left, pause for `LOW_BUDGET_PAUSE`.
 const BUDGET_FLOOR: u64 = 150;
+const LOW_BUDGET_PAUSE: i64 = 30 * 60;
+/// Ignore manual refreshes this soon after the previous one.
+const MANUAL_DEBOUNCE: i64 = 15;
 
 pub struct AppState {
     config: Mutex<Config>,
     config_mtime: Mutex<Option<SystemTime>>,
     snapshot: Mutex<Snapshot>,
     cache: Option<Cache>,
-    refresh_tx: Mutex<Option<mpsc::Sender<()>>>,
+    refresh_tx: Mutex<Option<mpsc::Sender<Wake>>>,
     window_state: Mutex<Option<WindowState>>,
     window_dirty: AtomicBool,
 }
@@ -99,7 +104,16 @@ fn get_meta(app: AppHandle) -> Meta {
 
 #[tauri::command]
 fn refresh_now(state: State<AppState>) {
-    request_refresh(&state);
+    wake_poller(&state, Wake::All);
+}
+
+/// Refetch one repo, leaving the others to the schedule.
+#[tauri::command]
+fn refresh_repo(app: AppHandle, state: State<AppState>, repo: String) {
+    if state.snapshot.lock().unwrap().request(&repo) {
+        emit_snapshot(&app);
+        wake_poller(&state, Wake::Repo);
+    }
 }
 
 /// Only GitHub links leave the app, and they go to the default browser.
@@ -153,9 +167,18 @@ fn quit(app: AppHandle) {
 
 // ───────────────────────────── polling ─────────────────────────────
 
-fn request_refresh(state: &AppState) {
+/// Why the poll thread is woken early.
+#[derive(Clone, Copy, PartialEq)]
+enum Wake {
+    /// Refresh everything (the toolbar button, ⌘R).
+    All,
+    /// A row's refresh button queued its repo in `Snapshot::requested`.
+    Repo,
+}
+
+fn wake_poller(state: &AppState, why: Wake) {
     if let Some(tx) = state.refresh_tx.lock().unwrap().as_ref() {
-        let _ = tx.send(());
+        let _ = tx.send(why);
     }
 }
 
@@ -206,217 +229,288 @@ fn reload_config_if_changed(app: &AppHandle) {
     emit_snapshot(app);
 }
 
-/// Fetch every configured repository once. Returns seconds until the next poll.
-fn run_cycle(app: &AppHandle) -> i64 {
+/// The poll thread's own bookkeeping between steps.
+#[derive(Default)]
+struct Pacing {
+    /// No request before this: the gap after a fetch, or a pause.
+    not_before: Option<DateTime<Utc>>,
+    /// Fetches in a row that GitHub rate-limited, for the backoff.
+    strikes: u32,
+    /// Low remaining quota is a protected pause even without a rate-limit error.
+    low_budget_pause: bool,
+    /// Debounce toolbar refreshes without suppressing individual row requests.
+    last_manual: Option<DateTime<Utc>>,
+    /// The last manual refresh, while repos older than it remain.
+    forced_since: Option<DateTime<Utc>>,
+}
+
+impl Pacing {
+    fn manual_wake(&mut self, all: bool, now: DateTime<Utc>) {
+        let fresh = self
+            .last_manual
+            .is_none_or(|t| (now - t).num_seconds() >= MANUAL_DEBOUNCE);
+        if all && fresh {
+            self.last_manual = Some(now);
+            self.forced_since = Some(now);
+        }
+        // Manual requests may skip the normal gap or token-recovery pause,
+        // never a server backoff or the low-budget pause.
+        if (fresh || !all) && self.strikes == 0 && !self.low_budget_pause {
+            self.not_before = None;
+        }
+    }
+}
+
+/// Fetch `repo` into the snapshot. Errors about this repo land on its row;
+/// a missing or rejected token doesn't, since it isn't the repo's fault.
+fn fetch_into_snapshot(app: &AppHandle, cfg: &Config, repo: &str) -> Result<(), GhError> {
+    let state = app.state::<AppState>();
+    let token = resolve_token(&cfg.github_token);
+    state.snapshot.lock().unwrap().token = Some(TokenStatus {
+        source: token.as_ref().ok().map(|t| t.source.to_string()),
+        rejected: false,
+    });
+    let gh = token.and_then(|t| GitHub::new(t.value))?;
+
+    let now = Utc::now();
+    let raw_dir = state.cache.as_ref().map(|c| c.dir().to_path_buf());
+    let mut raw = raw_dir
+        .as_deref()
+        .map(|d| RawActivity::load(d, repo))
+        .unwrap_or_default();
+    let result = gh.fetch_repo(repo, now, &mut raw);
+    if let (Ok(_), Some(dir)) = (&result, &raw_dir) {
+        if let Err(e) = raw.save(dir, repo) {
+            eprintln!("{repo}: could not save raw cache: {e}");
+        }
+    }
+    // The icon only changes with its blob, so most fetches skip the download.
+    let held_icon = {
+        let snap = state.snapshot.lock().unwrap();
+        snap.repos
+            .iter()
+            .find(|e| e.repo == repo)
+            .and_then(|e| e.icon_oid.clone())
+    };
+    let icon = match &result {
+        Ok((stats, _)) => stats
+            .icon_oid
+            .as_ref()
+            .filter(|oid| Some(*oid) != held_icon.as_ref())
+            .map(|oid| (oid.clone(), gh.icon(repo, oid))),
+        Err(_) => None,
+    };
+
+    let mut snap = state.snapshot.lock().unwrap();
+    let outcome = {
+        let Some(entry) = snap.repos.iter_mut().find(|e| e.repo == repo) else {
+            return Ok(());
+        };
+        entry.last_attempt_at = Some(now);
+        match result {
+            Ok((stats, budget)) => {
+                match icon {
+                    Some((oid, Ok(uri))) => {
+                        entry.icon = Some(uri);
+                        entry.icon_oid = Some(oid);
+                    }
+                    Some((_, Err(e))) => eprintln!("{repo}: icon: {e}"),
+                    None if stats.icon_oid.is_none() => {
+                        entry.icon = None;
+                        entry.icon_oid = None;
+                    }
+                    None => {}
+                }
+                entry.stats = Some(stats);
+                entry.fetched_at = Some(now);
+                entry.error = None;
+                entry.inaccessible = false;
+                Ok(budget.graphql_remaining)
+            }
+            Err(GhError::NotFound) => {
+                entry.stats = None;
+                entry.icon = None;
+                entry.icon_oid = None;
+                entry.fetched_at = Some(now);
+                entry.error = None;
+                entry.inaccessible = true;
+                Ok(None)
+            }
+            Err(GhError::Unauthorized) => Err(GhError::Unauthorized),
+            Err(e) => {
+                entry.error = Some(e.to_string());
+                Err(e)
+            }
+        }
+    };
+    match outcome {
+        Ok(left) => {
+            if left.is_some() {
+                snap.rate_limit_remaining = left;
+            }
+            Ok(())
+        }
+        Err(GhError::Unauthorized) => {
+            if let Some(t) = snap.token.as_mut() {
+                t.rejected = true;
+            }
+            Err(GhError::Unauthorized)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// When a rate limit GitHub reported (`RateLimited`'s text) lifts.
+fn rate_limit_end(until: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if let Ok(t) = DateTime::parse_from_rfc3339(until) {
+        return Some(t.with_timezone(&Utc));
+    }
+    // "the top of the hour": GraphQL's hourly budget resets on the hour.
+    (until == "the top of the hour").then(|| {
+        let next = now + chrono::Duration::hours(1);
+        next.with_minute(0)
+            .and_then(|t| t.with_second(0))
+            .unwrap_or(next)
+    })
+}
+
+fn clock(t: DateTime<Utc>) -> String {
+    t.with_timezone(&Local).format("%H:%M").to_string()
+}
+
+/// Fetch the most overdue repository, if one is due and pacing allows, and
+/// decide how long to wait before the next.
+fn step(app: &AppHandle, pacing: &mut Pacing) {
     let state = app.state::<AppState>();
     let cfg = state.config.lock().unwrap().clone();
-    {
+    let schedule = |pacing: &Pacing| Schedule {
+        refresh_secs: cfg.poll_secs(),
+        retry_secs: REPO_RETRY,
+        forced_since: pacing.forced_since,
+    };
+    let now = Utc::now();
+    let due = {
         let mut snap = state.snapshot.lock().unwrap();
         snap.sync_repos(&cfg.repos);
-        snap.refreshing = true;
-        // Measured afresh each cycle (the minimum any repo reported).
-        snap.rate_limit_remaining = None;
         snap.poll_secs = cfg.poll_secs();
         snap.stale_after_secs = cfg.stale_secs();
+        let paused = pacing.not_before.is_some_and(|t| now < t);
+        // Rows refreshed by hand go first.
+        let due = (!paused)
+            .then(|| {
+                snap.take_requested().or_else(|| {
+                    snap.next_due(now, &schedule(pacing))
+                        .map(|e| e.repo.clone())
+                })
+            })
+            .flatten();
+        snap.refreshing = due.is_some();
+        snap.fetching = due.clone();
+        due
+    };
+    if let Some(repo) = &due {
+        emit_snapshot(app);
+        let result = fetch_into_snapshot(app, &cfg, repo);
+        let now = Utc::now();
+        let mut snap = state.snapshot.lock().unwrap();
+        pacing.low_budget_pause = false;
+        let (pause, error) = match result {
+            Err(GhError::RateLimited(until)) => {
+                pacing.strikes += 1;
+                let backoff = (BACKOFF_MIN << (pacing.strikes - 1).min(8)).min(BACKOFF_MAX);
+                let mut resume = now + chrono::Duration::seconds(backoff);
+                if let Some(end) = rate_limit_end(&until, now) {
+                    resume = resume.max(end);
+                }
+                let msg = format!("Rate limited by GitHub; pausing until {}", clock(resume));
+                (resume - now, Some(msg))
+            }
+            Err(GhError::Unauthorized) => {
+                let from = snap
+                    .token
+                    .as_ref()
+                    .and_then(|t| t.source.clone())
+                    .map_or(String::new(), |s| format!(" from {s}"));
+                let msg = format!(
+                    "GitHub rejected the token{from} (401): it may have expired or been revoked; replace it or unset it"
+                );
+                (chrono::Duration::seconds(cfg.poll_secs()), Some(msg))
+            }
+            Err(e @ GhError::NoToken) => (
+                chrono::Duration::seconds(cfg.poll_secs()),
+                Some(e.to_string()),
+            ),
+            _ => {
+                pacing.strikes = 0;
+                if snap.rate_limit_remaining.is_some_and(|r| r < BUDGET_FLOOR) {
+                    pacing.low_budget_pause = true;
+                    let resume = now + chrono::Duration::seconds(LOW_BUDGET_PAUSE);
+                    let msg = format!("GitHub API budget low; pausing until {}", clock(resume));
+                    (resume - now, Some(msg))
+                } else {
+                    (chrono::Duration::seconds(REPO_GAP), None)
+                }
+            }
+        };
+        pacing.not_before = Some(now + pause);
+        snap.refreshing = false;
+        snap.fetching = None;
+        // Keep a config error up until the file is fixed.
+        if !snap
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("Config"))
+        {
+            snap.error = error;
+        }
+        if snap.next_due(now, &schedule(pacing)).is_none() {
+            pacing.forced_since = None;
+            if snap.repos.iter().all(|e| e.error.is_none()) && snap.error.is_none() {
+                snap.last_full_refresh_at = Some(now);
+            }
+        }
+        if let Some(cache) = &state.cache {
+            if let Err(e) = cache.save(&snap) {
+                eprintln!("could not save cache: {e}");
+            }
+        }
+    }
+    {
+        let mut snap = state.snapshot.lock().unwrap();
+        let next = snap
+            .next_due_at(&schedule(pacing))
+            .map(|t| t.max(Utc::now()))
+            .map(|t| pacing.not_before.map_or(t, |p| t.max(p)));
+        if snap.next_refresh_at == next && due.is_none() {
+            return;
+        }
+        snap.next_refresh_at = next;
     }
     emit_snapshot(app);
-
-    let finish = |error: Option<String>, next_in: i64, all_ok: bool| {
-        {
-            let mut snap = state.snapshot.lock().unwrap();
-            snap.refreshing = false;
-            snap.error = error;
-            if all_ok {
-                snap.last_full_refresh_at = Some(Utc::now());
-            }
-            snap.next_refresh_at = Some(Utc::now() + chrono::Duration::seconds(next_in));
-            if let Some(cache) = &state.cache {
-                if let Err(e) = cache.save(&snap) {
-                    eprintln!("could not save cache: {e}");
-                }
-            }
-        }
-        emit_snapshot(app);
-        update_tray(app);
-        next_in
-    };
-
-    let gh = match resolve_token(&cfg.github_token).and_then(GitHub::new) {
-        Ok(gh) => gh,
-        Err(e) => return finish(Some(e.to_string()), RETRY_AFTER_FAILURE * 5, false),
-    };
-
-    let queue = Mutex::new(cfg.repos.iter().rev().cloned().collect::<Vec<_>>());
-    let failures = Mutex::new(Vec::<GhError>::new());
-    // Once GitHub rate-limits one repo, more requests only prolong it.
-    let halted = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        for _ in 0..WORKERS.min(cfg.repos.len()) {
-            scope.spawn(|| loop {
-                if halted.load(Ordering::Relaxed) {
-                    break;
-                }
-                let Some(repo) = queue.lock().unwrap().pop() else {
-                    break;
-                };
-                let now = Utc::now();
-                let raw_dir = state.cache.as_ref().map(|c| c.dir().to_path_buf());
-                let mut raw = raw_dir
-                    .as_deref()
-                    .map(|d| RawActivity::load(d, &repo))
-                    .unwrap_or_default();
-                let result = gh.fetch_repo(&repo, now, &mut raw);
-                if let (Ok(_), Some(dir)) = (&result, &raw_dir) {
-                    if let Err(e) = raw.save(dir, &repo) {
-                        eprintln!("{repo}: could not save raw cache: {e}");
-                    }
-                }
-                // The icon only changes with its blob, so most polls skip the download.
-                let held_icon = {
-                    let snap = state.snapshot.lock().unwrap();
-                    snap.repos
-                        .iter()
-                        .find(|e| e.repo == repo)
-                        .and_then(|e| e.icon_oid.clone())
-                };
-                let icon = match &result {
-                    Ok((stats, _)) => stats
-                        .icon_oid
-                        .as_ref()
-                        .filter(|oid| Some(*oid) != held_icon.as_ref())
-                        .map(|oid| (oid.clone(), gh.icon(&repo, oid))),
-                    Err(_) => None,
-                };
-                {
-                    let mut snap = state.snapshot.lock().unwrap();
-                    let Some(entry) = snap.repos.iter_mut().find(|e| e.repo == repo) else {
-                        continue;
-                    };
-                    entry.last_attempt_at = Some(now);
-                    match result {
-                        Ok((stats, budget)) => {
-                            match icon {
-                                Some((oid, Ok(uri))) => {
-                                    entry.icon = Some(uri);
-                                    entry.icon_oid = Some(oid);
-                                }
-                                Some((_, Err(e))) => eprintln!("{repo}: icon: {e}"),
-                                None if stats.icon_oid.is_none() => {
-                                    entry.icon = None;
-                                    entry.icon_oid = None;
-                                }
-                                None => {}
-                            }
-                            entry.stats = Some(stats);
-                            entry.fetched_at = Some(now);
-                            entry.error = None;
-                            entry.inaccessible = false;
-                            if let Some(left) = budget.graphql_remaining {
-                                snap.rate_limit_remaining =
-                                    Some(snap.rate_limit_remaining.map_or(left, |r| r.min(left)));
-                            }
-                        }
-                        Err(GhError::NotFound) => {
-                            entry.stats = None;
-                            entry.icon = None;
-                            entry.icon_oid = None;
-                            entry.fetched_at = Some(now);
-                            entry.error = None;
-                            entry.inaccessible = true;
-                        }
-                        Err(e) => {
-                            if matches!(e, GhError::RateLimited(_)) {
-                                halted.store(true, Ordering::Relaxed);
-                            }
-                            entry.error = Some(e.to_string());
-                            failures.lock().unwrap().push(e);
-                        }
-                    }
-                    // Kept per repo, so a quit mid-poll loses nothing that landed.
-                    if let Some(cache) = &state.cache {
-                        if let Err(e) = cache.save(&snap) {
-                            eprintln!("could not save cache: {e}");
-                        }
-                    }
-                }
-                emit_snapshot(app);
-            });
-        }
-    });
-
-    let failures = failures.into_inner().unwrap();
-    let poll = cfg.poll_secs();
-    let rate_limited = failures
-        .iter()
-        .find(|e| matches!(e, GhError::RateLimited(_)));
-    if let Some(e) = rate_limited {
-        return finish(Some(e.to_string()), poll * 3, false);
-    }
-    if failures.iter().any(|e| matches!(e, GhError::Unauthorized)) {
-        return finish(Some(GhError::Unauthorized.to_string()), poll, false);
-    }
-    let low_budget = state
-        .snapshot
-        .lock()
-        .unwrap()
-        .rate_limit_remaining
-        .is_some_and(|r| r < BUDGET_FLOOR);
-    if failures.len() == cfg.repos.len() && !cfg.repos.is_empty() {
-        let msg = failures.first().map(|e| e.to_string());
-        return finish(msg, RETRY_AFTER_FAILURE, false);
-    }
-    let next = if low_budget { poll.max(30 * 60) } else { poll };
-    let error = low_budget.then(|| "GitHub API budget low; polling less often".to_string());
-    finish(error, next, failures.is_empty())
 }
 
-/// When the cached data is younger than one interval, wait out the rest of it
-/// instead of polling right at launch (relaunching shouldn't cost a poll),
-/// unless an older build wrote it and it lacks data the UI shows.
-fn first_due(snap: &Snapshot, poll_secs: i64) -> DateTime<Utc> {
-    let now = Utc::now();
-    if !snap.is_complete() {
-        return now;
-    }
-    match snap.oldest_data_at() {
-        Some(t) if (now - t).num_seconds() < poll_secs => t + chrono::Duration::seconds(poll_secs),
-        _ => now,
-    }
-}
-
-fn spawn_poller(app: AppHandle, rx: mpsc::Receiver<()>) {
+fn spawn_poller(app: AppHandle, rx: mpsc::Receiver<Wake>) {
     std::thread::Builder::new()
         .name("craft-poller".into())
         .spawn(move || {
-            let state = app.state::<AppState>();
-            let mut next_due = {
-                let poll = state.config.lock().unwrap().poll_secs();
-                let mut snap = state.snapshot.lock().unwrap();
-                let due = first_due(&snap, poll);
-                snap.next_refresh_at = Some(due);
-                due
-            };
-            let mut last_done: Option<DateTime<Utc>> = None;
-            let mut manual = false;
+            let mut pacing = Pacing::default();
             loop {
                 reload_config_if_changed(&app);
-                let now = Utc::now();
-                let debounced =
-                    last_done.is_some_and(|t| (now - t).num_seconds() < MANUAL_DEBOUNCE);
-                if now >= next_due || (manual && !debounced) {
-                    let next_in = run_cycle(&app);
-                    last_done = Some(Utc::now());
-                    next_due = Utc::now() + chrono::Duration::seconds(next_in);
-                } else {
-                    // Staleness changes with the clock alone.
-                    update_tray(&app);
-                }
-                manual = false;
+                step(&app, &mut pacing);
+                // Staleness changes with the clock alone.
+                update_tray(&app);
                 flush_window_state(&app);
-                match rx.recv_timeout(TICK) {
-                    Ok(()) => {
-                        manual = true;
-                        while rx.try_recv().is_ok() {}
+                let until_next = pacing
+                    .not_before
+                    .and_then(|t| (t - Utc::now()).to_std().ok())
+                    .filter(|d| !d.is_zero())
+                    .map_or(TICK, |d| d.min(TICK));
+                match rx.recv_timeout(until_next) {
+                    Ok(first) => {
+                        let all = std::iter::once(first)
+                            .chain(rx.try_iter())
+                            .any(|w| w == Wake::All);
+                        pacing.manual_wake(all, Utc::now());
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(TICK),
@@ -642,7 +736,7 @@ fn build_tray(app: &tauri::App, cfg: &Config) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "toggle" => toggle_window(app),
-            "refresh" => request_refresh(&app.state::<AppState>()),
+            "refresh" => wake_poller(&app.state::<AppState>(), Wake::All),
             "on_top" => {
                 let checked = app
                     .try_state::<TrayItems>()
@@ -702,6 +796,7 @@ pub fn run() {
             get_snapshot,
             get_meta,
             refresh_now,
+            refresh_repo,
             open_url,
             open_config,
             set_always_on_top,
@@ -757,6 +852,75 @@ mod tests {
     use super::*;
     use chrono::Duration as CDuration;
 
+    #[test]
+    fn manual_refresh_preserves_low_budget_pause_for_toolbar_and_row() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let deadline = now + CDuration::seconds(LOW_BUDGET_PAUSE);
+        for all in [true, false] {
+            let mut pacing = Pacing {
+                not_before: Some(deadline),
+                low_budget_pause: true,
+                ..Default::default()
+            };
+            pacing.manual_wake(all, now);
+            assert_eq!(pacing.not_before, Some(deadline));
+            assert_eq!(pacing.forced_since, all.then_some(now));
+            pacing.manual_wake(all, now + CDuration::seconds(60));
+            assert_eq!(pacing.not_before, Some(deadline));
+        }
+    }
+
+    #[test]
+    fn manual_refresh_preserves_server_backoff_for_toolbar_and_row() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let deadline = now + CDuration::seconds(BACKOFF_MIN);
+        for all in [true, false] {
+            let mut pacing = Pacing {
+                not_before: Some(deadline),
+                strikes: 1,
+                ..Default::default()
+            };
+            pacing.manual_wake(all, now);
+            assert_eq!(pacing.not_before, Some(deadline));
+            assert_eq!(pacing.strikes, 1);
+        }
+    }
+
+    #[test]
+    fn manual_refresh_can_skip_normal_gap_or_token_recovery_pause() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for pause_secs in [REPO_GAP, 30 * 60] {
+            for all in [true, false] {
+                let mut pacing = Pacing {
+                    not_before: Some(now + CDuration::seconds(pause_secs)),
+                    ..Default::default()
+                };
+                pacing.manual_wake(all, now);
+                assert_eq!(pacing.not_before, None);
+                assert_eq!(pacing.forced_since, all.then_some(now));
+            }
+        }
+    }
+
+    #[test]
+    fn toolbar_is_debounced_but_row_requests_can_skip_normal_gap() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let deadline = now + CDuration::seconds(REPO_GAP);
+        let mut pacing = Pacing::default();
+        pacing.manual_wake(true, now);
+        pacing.not_before = Some(deadline);
+        pacing.manual_wake(true, now + CDuration::seconds(1));
+        assert_eq!(pacing.not_before, Some(deadline));
+        assert_eq!(pacing.forced_since, Some(now));
+        pacing.manual_wake(false, now + CDuration::seconds(1));
+        assert_eq!(pacing.not_before, None);
+        pacing.not_before = Some(deadline);
+        let due = now + CDuration::seconds(MANUAL_DEBOUNCE);
+        pacing.manual_wake(true, due);
+        assert_eq!(pacing.not_before, None);
+        assert_eq!(pacing.forced_since, Some(due));
+    }
+
     fn snap_with(ages_mins: &[i64], now: DateTime<Utc>) -> Snapshot {
         let mut s = Snapshot {
             stale_after_secs: 15 * 60,
@@ -771,17 +935,13 @@ mod tests {
     }
 
     #[test]
-    fn first_poll_waits_for_fresh_cache_only() {
-        let now = Utc::now();
-        let mut fresh = snap_with(&[1, 2], now);
-        let due = first_due(&fresh, 300);
-        assert!(due > now + CDuration::seconds(150) && due <= now + CDuration::seconds(181));
-        // Stats written by a build that predates the activity windows.
-        fresh.repos[0].stats = Some(Default::default());
-        assert!(first_due(&fresh, 300) <= Utc::now());
-        let old = snap_with(&[1, 20], now);
-        assert!(first_due(&old, 300) <= Utc::now());
-        assert!(first_due(&Snapshot::default(), 300) <= Utc::now());
+    fn rate_limits_end_when_github_says() {
+        let now = "2026-10-18T04:20:00Z".parse::<DateTime<Utc>>().unwrap();
+        let at = rate_limit_end("2026-10-18T04:58:36.4+00:00", now).unwrap();
+        assert_eq!(at.to_rfc3339(), "2026-10-18T04:58:36.400+00:00");
+        let hour = rate_limit_end("the top of the hour", now).unwrap();
+        assert_eq!(hour.to_rfc3339(), "2026-10-18T05:00:00+00:00");
+        assert!(rate_limit_end("later", now).is_none());
     }
 
     #[test]

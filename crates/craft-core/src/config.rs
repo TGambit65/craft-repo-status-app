@@ -36,7 +36,8 @@ pub struct Config {
     pub repos: Vec<String>,
     pub poll_minutes: f64,
     pub stale_minutes: f64,
-    /// Optional. Otherwise `GITHUB_TOKEN` / `GH_TOKEN`, otherwise `gh auth token`.
+    /// Optional, used only when `CRAFT_STATUS_GITHUB_TOKEN`, `GITHUB_TOKEN`
+    /// and `GH_TOKEN` are unset; otherwise `gh auth token`.
     pub github_token: String,
     pub window: WindowConfig,
     pub tray: TrayConfig,
@@ -71,8 +72,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             repos: DEFAULT_REPOS.iter().map(|s| s.to_string()).collect(),
-            poll_minutes: 5.0,
-            stale_minutes: 15.0,
+            poll_minutes: 30.0,
+            stale_minutes: 60.0,
             github_token: String::new(),
             window: WindowConfig::default(),
             tray: TrayConfig::default(),

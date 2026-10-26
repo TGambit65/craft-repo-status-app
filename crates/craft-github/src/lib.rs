@@ -50,9 +50,9 @@ const MAX_PAGES: usize = 30;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("no GitHub token: set github_token in ~/.craft_status_config.toml, export GITHUB_TOKEN, or run `gh auth login`")]
+    #[error("no GitHub token: set CRAFT_STATUS_GITHUB_TOKEN or GITHUB_TOKEN, set github_token in ~/.craft_status_config.toml, or run `gh auth login`")]
     NoToken,
-    #[error("GitHub rejected the token (401); check github_token / `gh auth status`")]
+    #[error("GitHub rejected the token (401): it may have expired or been revoked")]
     Unauthorized,
     #[error("rate limited by GitHub until {0}")]
     RateLimited(String),
@@ -69,20 +69,21 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Token from config, then `GITHUB_TOKEN` / `GH_TOKEN`, then the GitHub CLI.
+/// Environment variables checked for a token, in order, before the config.
+pub const TOKEN_VARS: [&str; 3] = ["CRAFT_STATUS_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"];
+
+/// A GitHub token and where it came from (`$GITHUB_TOKEN`, `config`, `gh CLI`…).
+pub struct Token {
+    pub value: String,
+    pub source: &'static str,
+}
+
+/// Token from [`TOKEN_VARS`], then config, then the GitHub CLI.
 /// Apps launched from Finder don't inherit the shell PATH, so the usual
 /// install locations of `gh` are tried explicitly.
-pub fn resolve_token(configured: &str) -> Result<String> {
-    let t = configured.trim();
-    if !t.is_empty() {
-        return Ok(t.to_string());
-    }
-    for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.trim().is_empty() {
-                return Ok(v.trim().to_string());
-            }
-        }
+pub fn resolve_token(configured: &str) -> Result<Token> {
+    if let Some(t) = env_or_config_token(configured, |var| std::env::var(var).ok()) {
+        return Ok(t);
     }
     for gh in [
         "gh",
@@ -93,11 +94,29 @@ pub fn resolve_token(configured: &str) -> Result<String> {
         if let Ok(out) = Command::new(gh).args(["auth", "token"]).output() {
             let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if out.status.success() && !tok.is_empty() {
-                return Ok(tok);
+                return Ok(Token {
+                    value: tok,
+                    source: "gh CLI",
+                });
             }
         }
     }
     Err(Error::NoToken)
+}
+
+/// The first non-blank of [`TOKEN_VARS`] (looked up with `env`), else `configured`.
+fn env_or_config_token(configured: &str, env: impl Fn(&str) -> Option<String>) -> Option<Token> {
+    const SOURCES: [&str; 3] = ["$CRAFT_STATUS_GITHUB_TOKEN", "$GITHUB_TOKEN", "$GH_TOKEN"];
+    TOKEN_VARS
+        .iter()
+        .zip(SOURCES)
+        .filter_map(|(var, source)| Some((env(var)?, source)))
+        .chain([(configured.to_string(), "config")])
+        .map(|(t, source)| Token {
+            value: t.trim().to_string(),
+            source,
+        })
+        .find(|t| !t.value.is_empty())
 }
 
 pub struct GitHub {
@@ -931,6 +950,38 @@ query($owner: String!, $name: String!, $tag: String!, $branch: String!, $at: Git
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_prefers_env_then_config() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |var: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let both = env(&[
+            ("GITHUB_TOKEN", "generic"),
+            ("CRAFT_STATUS_GITHUB_TOKEN", " mine "),
+        ]);
+        let got = |t: Option<Token>| t.map(|t| (t.value, t.source));
+        assert_eq!(
+            got(env_or_config_token("cfg", both)),
+            Some(("mine".into(), "$CRAFT_STATUS_GITHUB_TOKEN"))
+        );
+        let generic = env(&[("GH_TOKEN", "gh"), ("GITHUB_TOKEN", "generic")]);
+        assert_eq!(
+            got(env_or_config_token("cfg", generic)),
+            Some(("generic".into(), "$GITHUB_TOKEN"))
+        );
+        let blank = env(&[("CRAFT_STATUS_GITHUB_TOKEN", "  ")]);
+        assert_eq!(
+            got(env_or_config_token(" cfg\n", blank)),
+            Some(("cfg".into(), "config"))
+        );
+        assert!(env_or_config_token("", env(&[])).is_none());
+    }
 
     #[test]
     fn builds_stats_from_payloads() {

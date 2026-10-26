@@ -5,3 +5,8 @@
 .DS_Store
 node_modules/
 ui/dev-snapshot.json
+ui/build/
+
+# Local configs that may hold a GitHub token
+craft_status_config.toml
+.craft_status_config.toml

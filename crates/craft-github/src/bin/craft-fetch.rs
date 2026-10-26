@@ -18,7 +18,7 @@ fn main() {
     } else {
         args
     };
-    let gh = match resolve_token(&cfg.github_token).and_then(GitHub::new) {
+    let gh = match resolve_token(&cfg.github_token).and_then(|t| GitHub::new(t.value)) {
         Ok(gh) => gh,
         Err(e) => {
             eprintln!("{e}");

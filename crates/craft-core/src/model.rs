@@ -11,7 +11,7 @@ use crate::BuildLag;
 pub type Time = DateTime<Utc>;
 
 /// The "recent activity" windows, as `(id, minutes)`, shortest first. Every
-/// poll fetches all of them; the UI's dropdown picks one by id (`ui/model.js`
+/// poll fetches all of them; the UI's dropdown picks one by id (`ui/src/model.ts`
 /// lists the same ids).
 pub const WINDOWS: &[(&str, i64)] = &[
     ("10m", 10),
@@ -134,6 +134,37 @@ impl RepoEntry {
         self.repo.rsplit('/').next().unwrap_or(&self.repo)
     }
 
+    /// No data yet, or stats from an older build that lack a field the UI
+    /// shows: today, a recent-activity window (all time included, and since
+    /// the release for repos with one).
+    pub fn is_hole(&self) -> bool {
+        self.fetched_at.is_none()
+            || self.stats.as_ref().is_some_and(|s| {
+                !WINDOWS
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .chain([ALL_TIME])
+                    .chain(s.latest_build_at.map(|_| SINCE_RELEASE))
+                    .all(|id| s.recent.contains_key(id))
+            })
+    }
+
+    /// When this repo should next be fetched: at once if it's a hole or older
+    /// than a manual refresh, else once its data is `refresh_secs` old; never
+    /// sooner than `retry_secs` after a failed attempt.
+    pub fn due_at(&self, schedule: &Schedule) -> Time {
+        let due = match self.fetched_at {
+            Some(t) if !self.is_hole() && schedule.forced_since.is_none_or(|f| t >= f) => {
+                t + chrono::Duration::seconds(schedule.refresh_secs)
+            }
+            _ => Time::MIN_UTC,
+        };
+        match (&self.error, self.last_attempt_at) {
+            (Some(_), Some(t)) => due.max(t + chrono::Duration::seconds(schedule.retry_secs)),
+            _ => due,
+        }
+    }
+
     pub fn is_stale(&self, now: Time, stale_after_secs: i64) -> bool {
         match self.fetched_at {
             Some(t) => (now - t).num_seconds() > stale_after_secs,
@@ -156,6 +187,36 @@ pub struct Snapshot {
     pub rate_limit_remaining: Option<u64>,
     /// Problems that aren't about one repository (no token, rate limited…).
     pub error: Option<String>,
+    /// The GitHub token the last poll used; `None` before the first poll.
+    pub token: Option<TokenStatus>,
+    /// The repo being fetched right now. Not restored from the cache.
+    #[serde(skip_deserializing)]
+    pub fetching: Option<String>,
+    /// Repos refreshed by hand from their row, waiting their turn (first
+    /// asked, first fetched). Not restored from the cache.
+    #[serde(skip_deserializing)]
+    pub requested: Vec<String>,
+}
+
+/// How often the poller fetches each repository (see [`RepoEntry::due_at`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Schedule {
+    /// Refetch a repo once its data is this old.
+    pub refresh_secs: i64,
+    /// Wait this long after a failed attempt before retrying that repo.
+    pub retry_secs: i64,
+    /// A manual refresh: data older than this is due at once.
+    pub forced_since: Option<Time>,
+}
+
+/// Where the poller's GitHub token came from, and whether GitHub took it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TokenStatus {
+    /// `$GITHUB_TOKEN`, `config`, `gh CLI`…; `None` when no token was found.
+    pub source: Option<String>,
+    /// GitHub answered 401: expired, revoked or mistyped.
+    pub rejected: bool,
 }
 
 impl Snapshot {
@@ -171,19 +232,42 @@ impl Snapshot {
             .flatten()
     }
 
-    /// False when some repo's stats predate a field the UI needs: today, a
-    /// recent-activity window (all time included, and since the release
-    /// for repos with one). Such a cache (from an older build) shouldn't
-    /// delay the launch poll.
-    pub fn is_complete(&self) -> bool {
-        self.repos.iter().filter_map(|r| r.stats.as_ref()).all(|s| {
-            WINDOWS
-                .iter()
-                .map(|(id, _)| *id)
-                .chain([ALL_TIME])
-                .chain(s.latest_build_at.map(|_| SINCE_RELEASE))
-                .all(|id| s.recent.contains_key(id))
-        })
+    /// The repo to fetch next at `now`: holes first, in config order, then
+    /// whichever due repo has the oldest data. `None` when nothing is due.
+    pub fn next_due(&self, now: Time, schedule: &Schedule) -> Option<&RepoEntry> {
+        self.repos
+            .iter()
+            .filter(|e| e.due_at(schedule) <= now)
+            .min_by_key(|e| (!e.is_hole(), e.fetched_at))
+    }
+
+    /// Queue `repo` to be fetched on its own, ahead of the schedule. False if
+    /// it isn't configured, or is already queued or being fetched.
+    pub fn request(&mut self, repo: &str) -> bool {
+        let known = self.repos.iter().any(|e| e.repo == repo);
+        let pending =
+            self.fetching.as_deref() == Some(repo) || self.requested.iter().any(|r| r == repo);
+        if !known || pending {
+            return false;
+        }
+        self.requested.push(repo.to_string());
+        true
+    }
+
+    /// The next repo refreshed by hand, dropping any no longer configured.
+    pub fn take_requested(&mut self) -> Option<String> {
+        while !self.requested.is_empty() {
+            let repo = self.requested.remove(0);
+            if self.repos.iter().any(|e| e.repo == repo) {
+                return Some(repo);
+            }
+        }
+        None
+    }
+
+    /// When the next repo falls due; `None` with nothing configured.
+    pub fn next_due_at(&self, schedule: &Schedule) -> Option<Time> {
+        self.repos.iter().map(|e| e.due_at(schedule)).min()
     }
 
     pub fn is_stale(&self, now: Time) -> bool {
@@ -240,32 +324,112 @@ mod tests {
     }
 
     #[test]
-    fn cache_without_every_window_is_incomplete() {
-        let mut s = Snapshot::default();
-        s.sync_repos(&["o/a".into(), "o/b".into()]);
-        assert!(s.is_complete(), "no stats yet is not a reason to refetch");
+    fn cache_without_every_window_is_a_hole() {
+        let mut e = RepoEntry::new("o/a");
+        assert!(e.is_hole(), "never fetched");
+        e.fetched_at = Some(Utc::now());
+        assert!(
+            !e.is_hole(),
+            "fetched, but inaccessible: no stats to complete"
+        );
         let mut stats = RepoStats::default();
-        s.repos[0].stats = Some(stats.clone());
-        assert!(!s.is_complete(), "cache from before the windows existed");
+        e.stats = Some(stats.clone());
+        assert!(e.is_hole(), "cache from before the windows existed");
         for (id, _) in WINDOWS {
             stats.recent.insert(id.to_string(), Activity::default());
         }
-        s.repos[0].stats = Some(stats.clone());
-        assert!(!s.is_complete(), "cache from before all time was a window");
+        e.stats = Some(stats.clone());
+        assert!(e.is_hole(), "cache from before all time was a window");
         stats.recent.insert(ALL_TIME.into(), Activity::default());
-        s.repos[0].stats = Some(stats.clone());
-        assert!(s.is_complete(), "no build, so no since-release window");
+        e.stats = Some(stats.clone());
+        assert!(!e.is_hole(), "no build, so no since-release window");
         stats.latest_build_at = Some(Utc::now());
-        s.repos[0].stats = Some(stats.clone());
-        assert!(
-            !s.is_complete(),
-            "cache from before since-release was a window"
-        );
+        e.stats = Some(stats.clone());
+        assert!(e.is_hole(), "cache from before since-release was a window");
         stats
             .recent
             .insert(SINCE_RELEASE.into(), Activity::default());
-        s.repos[0].stats = Some(stats);
-        assert!(s.is_complete());
+        e.stats = Some(stats);
+        assert!(!e.is_hole());
+    }
+
+    #[test]
+    fn schedule_fills_holes_then_the_stalest() {
+        let now = Utc::now();
+        let sched = Schedule {
+            refresh_secs: 30 * 60,
+            retry_secs: 10 * 60,
+            forced_since: None,
+        };
+        let mut s = Snapshot::default();
+        s.sync_repos(&["o/fresh".into(), "o/old".into(), "o/older".into()]);
+        s.repos[0].fetched_at = at(5, now);
+        s.repos[1].fetched_at = at(40, now);
+        s.repos[2].fetched_at = at(50, now);
+        let next =
+            |s: &Snapshot, sched: &Schedule| s.next_due(now, sched).map(|e| e.name().to_string());
+        assert_eq!(next(&s, &sched).as_deref(), Some("older"));
+
+        s.sync_repos(&[
+            "o/fresh".into(),
+            "o/old".into(),
+            "o/older".into(),
+            "o/new".into(),
+        ]);
+        assert_eq!(next(&s, &sched).as_deref(), Some("new"), "holes first");
+
+        s.repos[3].fetched_at = Some(now);
+        s.repos[2].fetched_at = Some(now);
+        s.repos[1].error = Some("network".into());
+        s.repos[1].last_attempt_at = at(1, now);
+        assert_eq!(next(&s, &sched), None, "a failed repo waits out its retry");
+        assert_eq!(
+            s.next_due_at(&sched),
+            at(1, now).map(|t| t + Duration::minutes(10))
+        );
+
+        let forced = Schedule {
+            forced_since: Some(now),
+            ..sched
+        };
+        assert_eq!(
+            next(&s, &forced).as_deref(),
+            Some("fresh"),
+            "a manual refresh makes everything due, stalest first"
+        );
+        assert!(Snapshot::default().next_due_at(&sched).is_none());
+    }
+
+    #[test]
+    fn rows_refreshed_by_hand_queue_once_each() {
+        let mut s = Snapshot::default();
+        s.sync_repos(&["o/a".into(), "o/b".into(), "o/c".into()]);
+        assert!(s.request("o/b"));
+        assert!(!s.request("o/b"), "already queued");
+        assert!(!s.request("o/zzz"), "not configured");
+        assert!(s.request("o/c"));
+        assert!(s.request("o/a"));
+        s.sync_repos(&["o/b".into(), "o/a".into()]);
+        assert_eq!(s.take_requested().as_deref(), Some("o/b"));
+        s.fetching = Some("o/b".into());
+        assert!(!s.request("o/b"), "being fetched");
+        assert_eq!(
+            s.take_requested().as_deref(),
+            Some("o/a"),
+            "o/c left the config"
+        );
+        assert_eq!(s.take_requested(), None);
+    }
+
+    #[test]
+    fn hand_refreshes_are_not_restored_from_the_cache() {
+        let mut s = Snapshot::default();
+        s.sync_repos(&["o/a".into()]);
+        s.request("o/a");
+        s.fetching = Some("o/a".into());
+        let back: Snapshot = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.requested.is_empty());
+        assert_eq!(back.fetching, None);
     }
 
     #[test]

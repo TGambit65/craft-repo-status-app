@@ -21,14 +21,17 @@ repos = [
   "storytold/figcraft",
 ]
 
-# How often to poll GitHub (minutes, at least 1). Each poll costs roughly
-# 6 GraphQL requests + 1 REST request per repo, far below GitHub's 5000/hour.
-poll_minutes = 5.0
+# How old a repo's data gets before it's refetched (minutes, at least 1).
+# Repos are fetched one at a time, missing data first, then the stalest, 20 s
+# apart; each costs roughly 6 GraphQL requests + 1 REST request.
+poll_minutes = 30.0
 
 # Data older than this is flagged STALE in the window (never less than poll_minutes).
-stale_minutes = 15.0
+stale_minutes = 60.0
 
-# Leave empty to use $GITHUB_TOKEN / $GH_TOKEN, or else `gh auth token`.
+# Used only if $CRAFT_STATUS_GITHUB_TOKEN, $GITHUB_TOKEN and $GH_TOKEN are all
+# unset; leave empty to fall back to `gh auth token`. Never commit a real token:
+# this file lives in your home directory, not in the repository.
 github_token = ""
 
 [window]
