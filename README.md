@@ -63,7 +63,7 @@ sort by a column again.
   list to that repo. Click an issue to open it on GitHub.
 - **Freshness**: the header shows when the oldest data on screen was fetched,
   and a pill that reads `FRESH`, `REFRESHING` or **`STALE`**. Data is stale
-  when any repo has gone `stale_minutes` (default 15) without a successful
+  when any repo has gone `stale_minutes` (default 60) without a successful
   fetch. A stale row is dimmed and gets an amber dot; a failed row gets a red
   dot, and its error appears in the banner. The tray tooltip also says
   whether the data is stale.

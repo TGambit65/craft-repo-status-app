@@ -50,7 +50,7 @@ const MAX_PAGES: usize = 30;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("no GitHub token: set CRAFT_STATUS_GITHUB_TOKEN or GITHUB_TOKEN, set github_token in ~/.craft_status_config.toml, or run `gh auth login`")]
+    #[error("no GitHub token: set CRAFT_STATUS_GITHUB_TOKEN, GITHUB_TOKEN or GH_TOKEN, set github_token in ~/.craft_status_config.toml, or run `gh auth login`")]
     NoToken,
     #[error("GitHub rejected the token (401): it may have expired or been revoked")]
     Unauthorized,
@@ -950,6 +950,16 @@ query($owner: String!, $name: String!, $tag: String!, $branch: String!, $at: Git
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_token_message_lists_all_supported_sources() {
+        let message = Error::NoToken.to_string();
+        for var in TOKEN_VARS {
+            assert!(message.contains(var), "missing token source: {var}");
+        }
+        assert!(message.contains("github_token in ~/.craft_status_config.toml"));
+        assert!(message.contains("gh auth login"));
+    }
 
     #[test]
     fn token_prefers_env_then_config() {

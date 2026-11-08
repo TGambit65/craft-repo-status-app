@@ -236,13 +236,82 @@ struct Pacing {
     not_before: Option<DateTime<Utc>>,
     /// Fetches in a row that GitHub rate-limited, for the backoff.
     strikes: u32,
+    /// Low remaining quota is a protected pause even without a rate-limit error.
+    low_budget_pause: bool,
+    /// Debounce toolbar refreshes without suppressing individual row requests.
+    last_manual: Option<DateTime<Utc>>,
     /// The last manual refresh, while repos older than it remain.
     forced_since: Option<DateTime<Utc>>,
 }
 
+impl Pacing {
+    fn manual_wake(&mut self, all: bool, now: DateTime<Utc>) {
+        let fresh = self
+            .last_manual
+            .is_none_or(|t| (now - t).num_seconds() >= MANUAL_DEBOUNCE);
+        if all && fresh {
+            self.last_manual = Some(now);
+            self.forced_since = Some(now);
+        }
+        // Manual requests may skip the normal gap or token-recovery pause,
+        // never a server backoff or the low-budget pause.
+        if (fresh || !all) && self.strikes == 0 && !self.low_budget_pause {
+            self.not_before = None;
+        }
+    }
+
+    /// Decide pacing using only this fetch's outcome. The last displayed budget
+    /// may predate GitHub's hourly reset and must not renew a low-budget pause.
+    fn after_fetch(
+        &mut self,
+        result: Result<Option<u64>, GhError>,
+        now: DateTime<Utc>,
+        poll_secs: i64,
+        token: Option<&TokenStatus>,
+    ) -> (chrono::Duration, Option<String>) {
+        self.low_budget_pause = false;
+        match result {
+            Err(GhError::RateLimited(until)) => {
+                self.strikes += 1;
+                let backoff = (BACKOFF_MIN << (self.strikes - 1).min(8)).min(BACKOFF_MAX);
+                let mut resume = now + chrono::Duration::seconds(backoff);
+                if let Some(end) = rate_limit_end(&until, now) {
+                    resume = resume.max(end);
+                }
+                let msg = format!("Rate limited by GitHub; pausing until {}", clock(resume));
+                (resume - now, Some(msg))
+            }
+            Err(GhError::Unauthorized) => {
+                let from = token
+                    .and_then(|t| t.source.clone())
+                    .map_or(String::new(), |s| format!(" from {s}"));
+                let msg = format!(
+                    "GitHub rejected the token{from} (401): it may have expired or been revoked; replace it or unset it"
+                );
+                (chrono::Duration::seconds(poll_secs), Some(msg))
+            }
+            Err(e @ GhError::NoToken) => {
+                (chrono::Duration::seconds(poll_secs), Some(e.to_string()))
+            }
+            other => {
+                self.strikes = 0;
+                if matches!(other, Ok(Some(left)) if left < BUDGET_FLOOR) {
+                    self.low_budget_pause = true;
+                    let resume = now + chrono::Duration::seconds(LOW_BUDGET_PAUSE);
+                    let msg = format!("GitHub API budget low; pausing until {}", clock(resume));
+                    (resume - now, Some(msg))
+                } else {
+                    (chrono::Duration::seconds(REPO_GAP), None)
+                }
+            }
+        }
+    }
+}
+
 /// Fetch `repo` into the snapshot. Errors about this repo land on its row;
 /// a missing or rejected token doesn't, since it isn't the repo's fault.
-fn fetch_into_snapshot(app: &AppHandle, cfg: &Config, repo: &str) -> Result<(), GhError> {
+/// Return only the budget observed by this fetch, not a previous snapshot value.
+fn fetch_into_snapshot(app: &AppHandle, cfg: &Config, repo: &str) -> Result<Option<u64>, GhError> {
     let state = app.state::<AppState>();
     let token = resolve_token(&cfg.github_token);
     state.snapshot.lock().unwrap().token = Some(TokenStatus {
@@ -283,7 +352,7 @@ fn fetch_into_snapshot(app: &AppHandle, cfg: &Config, repo: &str) -> Result<(), 
     let mut snap = state.snapshot.lock().unwrap();
     let outcome = {
         let Some(entry) = snap.repos.iter_mut().find(|e| e.repo == repo) else {
-            return Ok(());
+            return Ok(None);
         };
         entry.last_attempt_at = Some(now);
         match result {
@@ -327,7 +396,7 @@ fn fetch_into_snapshot(app: &AppHandle, cfg: &Config, repo: &str) -> Result<(), 
             if left.is_some() {
                 snap.rate_limit_remaining = left;
             }
-            Ok(())
+            Ok(left)
         }
         Err(GhError::Unauthorized) => {
             if let Some(t) = snap.token.as_mut() {
@@ -392,43 +461,7 @@ fn step(app: &AppHandle, pacing: &mut Pacing) {
         let result = fetch_into_snapshot(app, &cfg, repo);
         let now = Utc::now();
         let mut snap = state.snapshot.lock().unwrap();
-        let (pause, error) = match result {
-            Err(GhError::RateLimited(until)) => {
-                pacing.strikes += 1;
-                let backoff = (BACKOFF_MIN << (pacing.strikes - 1).min(8)).min(BACKOFF_MAX);
-                let mut resume = now + chrono::Duration::seconds(backoff);
-                if let Some(end) = rate_limit_end(&until, now) {
-                    resume = resume.max(end);
-                }
-                let msg = format!("Rate limited by GitHub; pausing until {}", clock(resume));
-                (resume - now, Some(msg))
-            }
-            Err(GhError::Unauthorized) => {
-                let from = snap
-                    .token
-                    .as_ref()
-                    .and_then(|t| t.source.clone())
-                    .map_or(String::new(), |s| format!(" from {s}"));
-                let msg = format!(
-                    "GitHub rejected the token{from} (401): it may have expired or been revoked; replace it or unset it"
-                );
-                (chrono::Duration::seconds(cfg.poll_secs()), Some(msg))
-            }
-            Err(e @ GhError::NoToken) => (
-                chrono::Duration::seconds(cfg.poll_secs()),
-                Some(e.to_string()),
-            ),
-            _ => {
-                pacing.strikes = 0;
-                if snap.rate_limit_remaining.is_some_and(|r| r < BUDGET_FLOOR) {
-                    let resume = now + chrono::Duration::seconds(LOW_BUDGET_PAUSE);
-                    let msg = format!("GitHub API budget low; pausing until {}", clock(resume));
-                    (resume - now, Some(msg))
-                } else {
-                    (chrono::Duration::seconds(REPO_GAP), None)
-                }
-            }
-        };
+        let (pause, error) = pacing.after_fetch(result, now, cfg.poll_secs(), snap.token.as_ref());
         pacing.not_before = Some(now + pause);
         snap.refreshing = false;
         snap.fetching = None;
@@ -471,7 +504,6 @@ fn spawn_poller(app: AppHandle, rx: mpsc::Receiver<Wake>) {
         .name("craft-poller".into())
         .spawn(move || {
             let mut pacing = Pacing::default();
-            let mut last_manual: Option<DateTime<Utc>> = None;
             loop {
                 reload_config_if_changed(&app);
                 step(&app, &mut pacing);
@@ -488,18 +520,7 @@ fn spawn_poller(app: AppHandle, rx: mpsc::Receiver<Wake>) {
                         let all = std::iter::once(first)
                             .chain(rx.try_iter())
                             .any(|w| w == Wake::All);
-                        let now = Utc::now();
-                        let fresh =
-                            last_manual.is_none_or(|t| (now - t).num_seconds() >= MANUAL_DEBOUNCE);
-                        if all && fresh {
-                            last_manual = Some(now);
-                            pacing.forced_since = Some(now);
-                        }
-                        // A manual refresh, of everything or of one row, skips
-                        // the gap or a token pause, but never a rate-limit backoff.
-                        if (fresh || !all) && pacing.strikes == 0 {
-                            pacing.not_before = None;
-                        }
+                        pacing.manual_wake(all, Utc::now());
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(TICK),
@@ -840,6 +861,155 @@ pub fn run() {
 mod tests {
     use super::*;
     use chrono::Duration as CDuration;
+
+    #[test]
+    fn low_budget_pause_uses_only_the_current_fetch_budget() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for budget in [0, BUDGET_FLOOR - 1, BUDGET_FLOOR, BUDGET_FLOOR + 1] {
+            let mut pacing = Pacing::default();
+            let (pause, error) = pacing.after_fetch(Ok(Some(budget)), now, 1800, None);
+            let low = budget < BUDGET_FLOOR;
+            assert_eq!(pacing.low_budget_pause, low);
+            assert_eq!(
+                pause.num_seconds(),
+                if low { LOW_BUDGET_PAUSE } else { REPO_GAP }
+            );
+            assert_eq!(error.is_some(), low);
+        }
+    }
+
+    #[test]
+    fn missing_budget_or_failed_fetch_does_not_renew_an_expired_low_budget_pause() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let outcomes = [
+            Ok(None), // Includes an inaccessible repo, which has no fresh budget.
+            Ok(Some(BUDGET_FLOOR)),
+            Err(GhError::Http(503, "unavailable".into())),
+            Err(GhError::GraphQl("request failed".into())),
+        ];
+        for outcome in outcomes {
+            let mut pacing = Pacing::default();
+            let (pause, _) = pacing.after_fetch(Ok(Some(1)), now, 1800, None);
+            let resume = now + pause;
+            pacing.not_before = Some(resume);
+            let (pause, error) = pacing.after_fetch(outcome, resume, 1800, None);
+            assert_eq!(pause.num_seconds(), REPO_GAP);
+            assert!(!pacing.low_budget_pause);
+            assert!(error.is_none());
+            assert_eq!(pacing.strikes, 0);
+            pacing.not_before = Some(resume + pause);
+            pacing.manual_wake(false, resume);
+            assert_eq!(pacing.not_before, None);
+        }
+    }
+
+    #[test]
+    fn rate_limit_backoff_remains_protected_after_low_budget_pause() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut pacing = Pacing {
+            low_budget_pause: true,
+            ..Default::default()
+        };
+        let (pause, error) = pacing.after_fetch(
+            Err(GhError::RateLimited("2026-10-26T12:00:00Z".into())),
+            now,
+            1800,
+            None,
+        );
+        assert_eq!(pause.num_seconds(), 3600);
+        assert!(error.unwrap().contains("Rate limited by GitHub"));
+        assert!(!pacing.low_budget_pause);
+        assert_eq!(pacing.strikes, 1);
+        pacing.not_before = Some(now + pause);
+        pacing.manual_wake(false, now);
+        assert_eq!(pacing.not_before, Some(now + pause));
+    }
+
+    #[test]
+    fn token_errors_keep_their_recovery_pause_and_guidance() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut pacing = Pacing::default();
+        let token = TokenStatus {
+            source: Some("$GH_TOKEN".into()),
+            rejected: true,
+        };
+        let (pause, error) = pacing.after_fetch(Err(GhError::Unauthorized), now, 600, Some(&token));
+        assert_eq!(pause.num_seconds(), 600);
+        assert!(error.unwrap().contains("from $GH_TOKEN"));
+        let (pause, error) = pacing.after_fetch(Err(GhError::NoToken), now, 600, None);
+        assert_eq!(pause.num_seconds(), 600);
+        assert!(error.unwrap().contains("GH_TOKEN"));
+        assert!(!pacing.low_budget_pause);
+    }
+
+    #[test]
+    fn manual_refresh_preserves_low_budget_pause_for_toolbar_and_row() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let deadline = now + CDuration::seconds(LOW_BUDGET_PAUSE);
+        for all in [true, false] {
+            let mut pacing = Pacing {
+                not_before: Some(deadline),
+                low_budget_pause: true,
+                ..Default::default()
+            };
+            pacing.manual_wake(all, now);
+            assert_eq!(pacing.not_before, Some(deadline));
+            assert_eq!(pacing.forced_since, all.then_some(now));
+            pacing.manual_wake(all, now + CDuration::seconds(60));
+            assert_eq!(pacing.not_before, Some(deadline));
+        }
+    }
+
+    #[test]
+    fn manual_refresh_preserves_server_backoff_for_toolbar_and_row() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let deadline = now + CDuration::seconds(BACKOFF_MIN);
+        for all in [true, false] {
+            let mut pacing = Pacing {
+                not_before: Some(deadline),
+                strikes: 1,
+                ..Default::default()
+            };
+            pacing.manual_wake(all, now);
+            assert_eq!(pacing.not_before, Some(deadline));
+            assert_eq!(pacing.strikes, 1);
+        }
+    }
+
+    #[test]
+    fn manual_refresh_can_skip_normal_gap_or_token_recovery_pause() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for pause_secs in [REPO_GAP, 30 * 60] {
+            for all in [true, false] {
+                let mut pacing = Pacing {
+                    not_before: Some(now + CDuration::seconds(pause_secs)),
+                    ..Default::default()
+                };
+                pacing.manual_wake(all, now);
+                assert_eq!(pacing.not_before, None);
+                assert_eq!(pacing.forced_since, all.then_some(now));
+            }
+        }
+    }
+
+    #[test]
+    fn toolbar_is_debounced_but_row_requests_can_skip_normal_gap() {
+        let now = "2026-10-26T11:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let deadline = now + CDuration::seconds(REPO_GAP);
+        let mut pacing = Pacing::default();
+        pacing.manual_wake(true, now);
+        pacing.not_before = Some(deadline);
+        pacing.manual_wake(true, now + CDuration::seconds(1));
+        assert_eq!(pacing.not_before, Some(deadline));
+        assert_eq!(pacing.forced_since, Some(now));
+        pacing.manual_wake(false, now + CDuration::seconds(1));
+        assert_eq!(pacing.not_before, None);
+        pacing.not_before = Some(deadline);
+        let due = now + CDuration::seconds(MANUAL_DEBOUNCE);
+        pacing.manual_wake(true, due);
+        assert_eq!(pacing.not_before, None);
+        assert_eq!(pacing.forced_since, Some(due));
+    }
 
     fn snap_with(ages_mins: &[i64], now: DateTime<Utc>) -> Snapshot {
         let mut s = Snapshot {
